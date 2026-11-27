@@ -1,225 +1,207 @@
-"""Демо SQL-решения на SQLite (чтобы не разворачивать Postgres/MySQL).
+"""SQLite-демо SQL-решения: те же запросы, что в sql_solution.md (PostgreSQL).
 
-Создаёт БД с теми же полями, грузит данные из того же Excel (переиспользует
-загрузчики billing_check) и прогоняет SQL-сверку. Отличия от MySQL-версии
-(sql_solution.md): WEEKDAY() -> strftime, DECIMAL -> целые единицы 1e-10 USD
-(точная арифметика без float).
+Деньги в целых единицах 1e-10 USD, wd/hh вычислены при загрузке -> запросы портируемые.
+Переиспользует загрузчики billing_check (одни данные, два движка — кросс-проверка).
 """
 from __future__ import annotations
 
 import argparse
 import sqlite3
-from decimal import Decimal
+import sys
+import time
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 import config
 from billing_check import load_workbook, parse_logs, parse_prices, build_schedule
 
+SCALE = Decimal(10**10)
+
+
+def _scaled(x: Decimal) -> int:
+    return int((x * SCALE).to_integral_value(rounding=ROUND_HALF_UP))
+
 DDL = """
-DROP TABLE IF EXISTS raw_logs;
-DROP TABLE IF EXISTS org_prices;
-DROP TABLE IF EXISTS price_windows;
-
--- staging БЕЗ unique по request_id: дубли — улика, их нельзя терять при загрузке
+DROP TABLE IF EXISTS raw_logs; DROP TABLE IF EXISTS org_prices; DROP TABLE IF EXISTS price_windows;
 CREATE TABLE raw_logs (
-    start_time TEXT NOT NULL,              -- UTC, DATETIME-аналог
-    request_id TEXT NOT NULL,
-    organization_id TEXT NOT NULL,
-    model_group TEXT NOT NULL,
+    start_time TEXT NOT NULL, wd INTEGER NOT NULL, hh INTEGER NOT NULL,
+    request_id TEXT NOT NULL, organization_id TEXT NOT NULL, model_group TEXT NOT NULL,
     status TEXT NOT NULL,
-    prompt_tokens INTEGER NOT NULL,
-    completion_tokens INTEGER NOT NULL,
-    cached_input_tokens INTEGER NOT NULL,
-    reasoning_tokens INTEGER NOT NULL,
-    audio_input_tokens INTEGER NOT NULL,
-    image_tokens INTEGER NOT NULL,
+    prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
+    cached_input_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL,
+    audio_input_tokens INTEGER NOT NULL, image_tokens INTEGER NOT NULL,
     output_image_tokens INTEGER NOT NULL,
-    accepted_prediction_tokens INTEGER NOT NULL,
-    rejected_prediction_tokens INTEGER NOT NULL,
-    input_cost REAL NOT NULL,              -- cost-колонки выгрузки как в источнике
-    cached_input_cost REAL NOT NULL,
-    output_cost REAL NOT NULL,
-    reasoning_cost REAL NOT NULL,
-    prediction_cost REAL NOT NULL,
-    image_cost REAL NOT NULL,
-    cache_creation_cost REAL NOT NULL,
-    web_search_cost REAL NOT NULL,
-    total_cost REAL NOT NULL
+    accepted_prediction_tokens INTEGER NOT NULL, rejected_prediction_tokens INTEGER NOT NULL,
+    input_cost INTEGER NOT NULL, cached_input_cost INTEGER NOT NULL,
+    output_cost INTEGER NOT NULL, reasoning_cost INTEGER NOT NULL,
+    prediction_cost INTEGER NOT NULL, image_cost INTEGER NOT NULL,
+    cache_creation_cost INTEGER NOT NULL, web_search_cost INTEGER NOT NULL,
+    total_cost INTEGER NOT NULL
 );
-CREATE INDEX idx_request ON raw_logs(request_id);
-
-CREATE TABLE org_prices (
-    organization_id TEXT PRIMARY KEY,
-    price_list TEXT NOT NULL
-);
-
--- расписание развёрнуто: строка = (прайс, модель, день недели, окно)
--- ставки INTEGER = $/1M * 10^4 -> стоимость tokens*rate в единицах 1e-10 USD (точно)
+CREATE INDEX idx_logs_request ON raw_logs(request_id);
+CREATE TABLE org_prices (organization_id TEXT PRIMARY KEY, price_list TEXT NOT NULL);
 CREATE TABLE price_windows (
-    price_list TEXT NOT NULL,
-    model_group TEXT NOT NULL,
-    weekday INTEGER NOT NULL,              -- 0=Пн … 6=Вс
-    h_from INTEGER NOT NULL,
-    h_to INTEGER NOT NULL,                 -- конец исключён
-    input_rate INTEGER NOT NULL,
-    output_rate INTEGER NOT NULL,
-    cache_rate INTEGER NOT NULL,
+    price_list TEXT NOT NULL, model_group TEXT NOT NULL,
+    weekday INTEGER NOT NULL, h_from INTEGER NOT NULL, h_to INTEGER NOT NULL,
+    input_rate INTEGER NOT NULL, output_rate INTEGER NOT NULL, cache_rate INTEGER NOT NULL,
     PRIMARY KEY (price_list, model_group, weekday, h_from)
 );
 """
 
-#环境与 SQLite: Monday-based weekday и час из строки UTC
-WD = "((CAST(strftime('%w', start_time) AS INTEGER) + 6) % 7)"
-HR = "CAST(strftime('%H', start_time) AS INTEGER)"
-SCALE = 10_000_000_000  # 1e10: перевод REAL-стоимости в целые единицы
-
-RECONCILE_SQL = f"""
+RECONCILE_SQL = """
 WITH rated AS (
-    SELECT l.*,
-           COALESCE(w.input_rate, 0)  AS ir,   -- LEFT JOIN + COALESCE = zero-rule
-           COALESCE(w.output_rate, 0) AS orr,
-           COALESCE(w.cache_rate, 0)  AS cr,
-           (l.completion_tokens - l.reasoning_tokens - l.audio_input_tokens
-            - l.image_tokens - l.output_image_tokens) AS text_tokens
+    SELECT l.*, COALESCE(w.input_rate,0) AS ir, COALESCE(w.output_rate,0) AS orr,
+           COALESCE(w.cache_rate,0) AS cr,
+           CASE WHEN w.input_rate IS NULL THEN 1 ELSE 0 END AS no_rate,
+           (l.completion_tokens-l.reasoning_tokens-l.audio_input_tokens-l.image_tokens-l.output_image_tokens) AS text_tokens
     FROM raw_logs l
-    JOIN org_prices o ON o.organization_id = l.organization_id
+    JOIN org_prices o ON o.organization_id=l.organization_id
     LEFT JOIN price_windows w
-           ON w.price_list = o.price_list
-          AND w.model_group = l.model_group
-          AND w.weekday = {WD}
-          AND w.h_from <= {HR} AND w.h_to > {HR}
+           ON w.price_list=o.price_list AND w.model_group=l.model_group
+          AND w.weekday=l.wd AND w.h_from<=l.hh AND w.h_to>l.hh
 ),
 calc AS (
-    SELECT request_id, start_time, model_group,
-           CAST(ROUND(total_cost * {SCALE}) AS INTEGER) AS export_1e10,
-           CAST(ROUND(input_cost * {SCALE}) AS INTEGER) AS exp_input,
-           CAST(ROUND(reasoning_cost * {SCALE}) AS INTEGER) AS exp_reason,
-           (prompt_tokens - cached_input_tokens) * ir AS ref_input,
-           cached_input_tokens * cr                   AS ref_cached,
-           text_tokens * orr                          AS ref_output,
-           reasoning_tokens * orr                     AS ref_reason,
-           (accepted_prediction_tokens + rejected_prediction_tokens) * orr AS ref_pred,
-           image_tokens * ir                          AS ref_image,
-           CAST(ROUND((cache_creation_cost + web_search_cost) * {SCALE}) AS INTEGER) AS extra,
-           ir
+    SELECT request_id, start_time, model_group, total_cost AS export_1e10,
+           input_cost, reasoning_cost, no_rate,
+           cached_input_cost, output_cost, prediction_cost, image_cost,
+           input_cost+cached_input_cost+output_cost+reasoning_cost+prediction_cost+image_cost
+           +cache_creation_cost+web_search_cost AS export_comp_sum,
+           (prompt_tokens-cached_input_tokens)*ir AS input_ref,
+           cached_input_tokens*cr AS cached_ref,
+           text_tokens*orr AS output_ref,
+           reasoning_tokens*orr AS reasoning_ref,
+           (accepted_prediction_tokens+rejected_prediction_tokens)*orr AS prediction_ref,
+           image_tokens*ir AS image_ref,
+           cache_creation_cost+web_search_cost AS extra_1e10
     FROM rated
+),
+tot AS (
+    SELECT *, (input_ref+cached_ref+output_ref+reasoning_ref+prediction_ref+image_ref+extra_1e10) AS correct_1e10
+    FROM calc
 )
 SELECT request_id, model_group,
-       export_1e10 / 1e10 AS export_usd,
-       (ref_input + ref_cached + ref_output + ref_reason + ref_pred + ref_image + extra) / 1e10 AS correct_usd,
+       export_1e10/10000000000.0, correct_1e10/10000000000.0,
+       (export_1e10-correct_1e10)/10000000000.0,
        CASE
-           WHEN ir IS NULL AND export_1e10 > extra THEN 'not_in_pricelist'
-           WHEN ABS(2 * exp_input - ref_input) <= 100
-            AND ABS(2 * (export_1e10 - extra) - (ref_input + ref_cached + ref_output + ref_reason + ref_pred + ref_image)) <= 400
-               THEN 'A_offpeak_in_peak'
-           WHEN ABS(exp_reason - 2 * ref_reason) <= 100 THEN 'reasoning_x2'
+           WHEN no_rate=1 AND export_1e10>extra_1e10 THEN 'not_in_pricelist'
+           WHEN ABS(export_1e10-export_comp_sum)>200 THEN
+               CASE WHEN export_1e10=0
+                     AND ABS(input_cost-input_ref)<=50
+                     AND ABS(cached_input_cost-cached_ref)<=50
+                     AND ABS(output_cost-output_ref)<=50
+                     AND ABS(reasoning_cost-reasoning_ref)<=50
+                     AND ABS(prediction_cost-prediction_ref)<=50
+                     AND ABS(image_cost-image_ref)<=50
+                    THEN 'total_zeroed' ELSE 'broken_total' END
+           WHEN ABS(2*input_cost-input_ref)<=100
+            AND ABS(2*(export_1e10-extra_1e10)-(correct_1e10-extra_1e10))<=400 THEN 'A_offpeak_in_peak'
+           WHEN ABS(input_cost-2*input_ref)<=100
+            AND ABS((export_1e10-extra_1e10)-2*(correct_1e10-extra_1e10))<=400 THEN 'peak_in_offpeak'
+           WHEN reasoning_ref>0 AND ABS(reasoning_cost-2*reasoning_ref)<=100 THEN 'reasoning_x2'
            ELSE 'unclassified'
-       END AS error_type
-FROM calc
-WHERE ABS(export_1e10 - (ref_input + ref_cached + ref_output + ref_reason + ref_pred + ref_image + extra)) > 10000
-ORDER BY ABS(export_1e10 - (ref_input + ref_cached + ref_output + ref_reason + ref_pred + ref_image + extra)) DESC;
+       END
+FROM tot
+WHERE ABS(export_1e10-correct_1e10)>10000
+   OR ABS(export_1e10-export_comp_sum)>200
+ORDER BY ABS(export_1e10-correct_1e10) DESC;
 """
 
-TOTALS_SQL = f"""
+TOTALS_SQL = """
 WITH rated AS (
     SELECT l.total_cost,
-           (l.prompt_tokens - l.cached_input_tokens) * COALESCE(w.input_rate, 0)
-           + l.cached_input_tokens * COALESCE(w.cache_rate, 0)
-           + (l.completion_tokens - l.reasoning_tokens - l.audio_input_tokens
-              - l.image_tokens - l.output_image_tokens) * COALESCE(w.output_rate, 0)
-           + l.reasoning_tokens * COALESCE(w.output_rate, 0)
-           + (l.accepted_prediction_tokens + l.rejected_prediction_tokens) * COALESCE(w.output_rate, 0)
-           + l.image_tokens * COALESCE(w.input_rate, 0)
-           + CAST(ROUND((l.cache_creation_cost + l.web_search_cost) * {SCALE}) AS INTEGER) AS ref_1e10
+           (l.prompt_tokens-l.cached_input_tokens)*COALESCE(w.input_rate,0)
+         + l.cached_input_tokens*COALESCE(w.cache_rate,0)
+         + (l.completion_tokens-l.reasoning_tokens-l.audio_input_tokens-l.image_tokens-l.output_image_tokens)*COALESCE(w.output_rate,0)
+         + l.reasoning_tokens*COALESCE(w.output_rate,0)
+         + (l.accepted_prediction_tokens+l.rejected_prediction_tokens)*COALESCE(w.output_rate,0)
+         + l.image_tokens*COALESCE(w.input_rate,0)
+         + l.cache_creation_cost + l.web_search_cost AS ref_1e10
     FROM raw_logs l
-    JOIN org_prices o ON o.organization_id = l.organization_id
+    JOIN org_prices o ON o.organization_id=l.organization_id
     LEFT JOIN price_windows w
-           ON w.price_list = o.price_list AND w.model_group = l.model_group
-          AND w.weekday = {WD} AND w.h_from <= {HR} AND w.h_to > {HR}
+           ON w.price_list=o.price_list AND w.model_group=l.model_group
+          AND w.weekday=l.wd AND w.h_from<=l.hh AND w.h_to>l.hh
 )
-SELECT SUM(ref_1e10) / 1e10 AS correct_usd,
-       SUM(total_cost)      AS export_usd,
-       SUM(total_cost) - SUM(ref_1e10) / 1e10 AS delta_usd
-FROM rated;
+SELECT SUM(ref_1e10)/10000000000.0, SUM(total_cost)/10000000000.0,
+       (SUM(total_cost)-SUM(ref_1e10))/10000000000.0 FROM rated;
 """
 
 DUPLICATES_SQL = """
-SELECT request_id, COUNT(*) AS n, SUM(total_cost) AS dup_sum
-FROM raw_logs GROUP BY request_id HAVING COUNT(*) > 1;
+SELECT request_id, COUNT(*), SUM(total_cost)/10000000000.0
+FROM raw_logs GROUP BY request_id HAVING COUNT(*)>1;
 """
-
 COVERAGE_SQL = """
-SELECT price_list, model_group, SUM(h_to - h_from) AS hours
-FROM price_windows GROUP BY price_list, model_group HAVING hours <> 168;
+SELECT price_list, model_group, SUM(h_to-h_from) FROM price_windows
+GROUP BY price_list, model_group HAVING SUM(h_to-h_from)<>168;
+"""
+INVARIANTS_SQL = """
+SELECT request_id FROM raw_logs
+WHERE cached_input_tokens>prompt_tokens
+   OR (completion_tokens-reasoning_tokens-audio_input_tokens-image_tokens-output_image_tokens)<0;
 """
 
 
 def create_db(db_path: Path, source: str) -> None:
+    t0 = time.perf_counter()
+    print(f"[1/4] Загрузка и парсинг: {source}", flush=True)
     xls = load_workbook(source)
     logs = parse_logs(xls)
     org_map, prices = parse_prices(xls)
     sched = build_schedule(prices)
+    print(f"      {len(logs)} строк, {len(sched)} моделей", flush=True)
 
+    print("[2/4] Создание SQLite и загрузка…", flush=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path)
     try:
         con.executescript(DDL)
-        con.executemany("INSERT INTO org_prices VALUES (?, ?)", org_map.items())
-
-        win_rows: list[tuple] = []
-        for (plist, model), windows in sched.items():
-            for w in windows:
-                for wd in sorted(w.weekdays):
-                    win_rows.append((
-                        plist, model, wd, w.h_from, w.h_to,
-                        int(w.rate.input * Decimal(SCALE)),
-                        int(w.rate.output * Decimal(SCALE)),
-                        int(w.rate.cache_read * Decimal(SCALE)),
-                    ))
+        con.executemany("INSERT INTO org_prices VALUES (?,?)", org_map.items())
+        win_rows = [
+            (pl, m, wd, w.h_from, w.h_to,
+             _scaled(w.rate.input), _scaled(w.rate.output), _scaled(w.rate.cache_read))
+            for (pl, m), ws in sched.items() for w in ws for wd in sorted(w.weekdays)
+        ]
         con.executemany("INSERT INTO price_windows VALUES (?,?,?,?,?,?,?,?)", win_rows)
-
         log_rows = [
-            (r.start_time.strftime("%Y-%m-%d %H:%M:%S.%f"), r.request_id, r.organization_id,
-             r.model_group, r.status, r.prompt_tokens, r.completion_tokens, r.cached_input_tokens,
-             r.reasoning_tokens, r.audio_input_tokens, r.image_tokens, r.output_image_tokens,
+            (r.start_time.strftime("%Y-%m-%d %H:%M:%S.%f"), r.start_time.weekday(), r.start_time.hour,
+             r.request_id, r.organization_id, r.model_group, r.status,
+             r.prompt_tokens, r.completion_tokens, r.cached_input_tokens, r.reasoning_tokens,
+             r.audio_input_tokens, r.image_tokens, r.output_image_tokens,
              r.accepted_prediction_tokens, r.rejected_prediction_tokens,
-             float(r.input_cost), float(r.cached_input_cost), float(r.output_cost),
-             float(r.reasoning_cost), float(r.prediction_cost), float(r.image_cost),
-             float(r.cache_creation_cost), float(r.web_search_cost), float(r.total_cost))
+             _scaled(r.input_cost), _scaled(r.cached_input_cost), _scaled(r.output_cost),
+             _scaled(r.reasoning_cost), _scaled(r.prediction_cost), _scaled(r.image_cost),
+             _scaled(r.cache_creation_cost), _scaled(r.web_search_cost), _scaled(r.total_cost))
             for r in logs.itertuples(index=False)
         ]
-        con.executemany("INSERT INTO raw_logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        con.executemany("INSERT INTO raw_logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         log_rows)
         con.commit()
-        print(f"БД создана: {db_path} ({len(log_rows)} строк, {len(win_rows)} окон)")
+        print(f"      БД: {db_path} ({len(log_rows)} строк, {len(win_rows)} окон)", flush=True)
 
-        print("\n--- Итоги (SQL) ---")
-        for row in con.execute(TOTALS_SQL):
-            print(f"эталон={row[0]:.6f}  выгрузка={row[1]:.6f}  Δ={row[2]:+.6f}")
-
-        print("\n--- Расхождения (SQL) ---")
-        rows = list(con.execute(RECONCILE_SQL))
+        print("[3/4] SQL-сверка…", flush=True)
+        row = con.execute(TOTALS_SQL).fetchone()
+        print(f"\n--- Итоги (SQL) ---\nэталон={row[0]:.6f}  выгрузка={row[1]:.6f}  Δ={row[2]:+.6f}")
+        rows = con.execute(RECONCILE_SQL).fetchall()
+        print(f"\n--- Расхождения (SQL): {len(rows)} ---")
         for r in rows[:15]:
-            print(f"{r[0]:45s} {r[1]:28s} export={r[2]:.8f} correct={r[3]:.8f} {r[4]}")
-        print(f"всего расхождений: {len(rows)}")
-
-        print("\n--- Дубли ---")
-        dups = list(con.execute(DUPLICATES_SQL))
-        print(dups or "нет")
-
-        print("\n--- Покрытие расписания (должно быть пусто) ---")
-        print(list(con.execute(COVERAGE_SQL)) or "OK: все модели покрыты на 168 ч")
+            print(f"{r[0]:45s} {r[1]:28s} export={r[2]:.8f} correct={r[3]:.8f} Δ={r[4]:+.8f} {r[5]}")
+        print(f"\n--- Дубли ---\n{con.execute(DUPLICATES_SQL).fetchall() or 'нет'}")
+        print(f"--- Покрытие 168ч ---\n{con.execute(COVERAGE_SQL).fetchall() or 'OK'}")
+        print(f"--- Инварианты токенов ---\n{con.execute(INVARIANTS_SQL).fetchall() or 'OK'}")
+        print(f"\n[4/4] Готово за {time.perf_counter() - t0:.1f}s. "
+              f"Сравни итоги с billing_check.py — должны совпасть.", flush=True)
     finally:
         con.close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SQLite-демо SQL-сверки")
-    parser.add_argument("--file", help="локальный .xlsx")
-    parser.add_argument("--url", default=config.SHEET_URL)
-    parser.add_argument("--db", type=Path, default=config.SQL_DEMO_DB)
-    args = parser.parse_args()
-    create_db(args.db, args.file or args.url)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    p = argparse.ArgumentParser(description="SQLite-демо SQL-сверки (запросы как в PostgreSQL)")
+    p.add_argument("--file"); p.add_argument("--url", default=config.SHEET_URL)
+    p.add_argument("--db", type=Path, default=config.SQL_DEMO_DB)
+    a = p.parse_args()
+    create_db(a.db, a.file or a.url)
 
 
 if __name__ == "__main__":

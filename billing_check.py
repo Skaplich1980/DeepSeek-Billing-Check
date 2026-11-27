@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import io
 import re
+import sys
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +25,9 @@ import reporting
 D = Decimal
 MILLION = D("1000000")
 Q8 = config.ROUND_SCALE
+# Компоненты выгрузки хранятся с полной точностью (9–10 знаков), total — 8.
+# Сравниваем компоненты с НЕокруглённым эталоном, допуск 5e-9 покрывает оба режима.
+COMP_TOL = D("0.000000005")
 
 TOKEN_COLS: tuple[str, ...] = (
     "prompt_tokens", "completion_tokens", "cached_input_tokens",
@@ -40,6 +45,9 @@ REF_COLS: tuple[str, ...] = COST_COLS[:6]
 
 DAY_NUM: dict[str, int] = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
+
+def _max_dev(exp: dict[str, Decimal], ref: dict[str, Decimal]) -> Decimal:
+    return max((abs(exp[c] - ref[c]) for c in REF_COLS), default=D(0))
 
 def q8(x: Decimal) -> Decimal:
     """Округление как в выгрузке: half-up до 8 знаков."""
@@ -112,22 +120,23 @@ def load_workbook(source: str) -> pd.ExcelFile:
 
 
 def _to_int(v: Any) -> int:
-    """Токены: '1,020' / 1020.0 / '' -> int."""
+    """Токены: '1,020' / 1020.0 / '' / 'nan' -> int."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return 0
-    if isinstance(v, str):
-        v = v.replace(",", "").replace(" ", "").strip()
-        if not v:
-            return 0
-    return int(float(v))
+    s = str(v).replace(",", "").replace(" ", "").strip()
+    if not s or s.lower() in ("nan", "none"):
+        return 0
+    return int(float(s))
 
 
 def _to_dec(v: Any) -> Decimal:
-    """Деньги/ставки: запятая как десятичный разделитель тоже допускается."""
+    """Деньги/ставки: запятая как десятичный разделитель тоже допускается; 'nan' -> 0."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return D(0)
     s = str(v).strip().replace(" ", "").replace(",", ".")
-    return D(s) if s else D(0)
+    if not s or s.lower() in ("nan", "none"):
+        return D(0)
+    return D(s)
 
 
 def _find_header(raw: pd.DataFrame, marker: str) -> int:
@@ -146,14 +155,21 @@ def parse_logs(xls: pd.ExcelFile) -> pd.DataFrame:
     df = df.rename(columns={"start_time (UTC)": "start_time", "Клиент": "client"})
     df = df.dropna(subset=["request_id"]).reset_index(drop=True)
 
-    df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
+    missing = [c for c in (*TOKEN_COLS, *COST_COLS, "total_cost") if c not in df.columns]
+    if missing:
+        _log(f"WARN: отсутствуют колонки {missing} — считаю 0")
+
+    # В полном файле формат смешанный: "…07:24:53" и "…07:24:53.123456".
+    # ISO8601 парсит оба; astype("string") нормализует и Excel-datetime тоже.
+    df["start_time"] = pd.to_datetime(
+        df["start_time"].astype("string").str.strip(), format="ISO8601", utc=True
+    )
     for c in TOKEN_COLS:
-        if c in df.columns:
-            df[c] = df[c].map(_to_int)
+        df[c] = df[c].map(_to_int) if c in df.columns else 0
     for c in (*COST_COLS, "total_cost"):
-        df[c] = df[c].map(_to_dec)
+        df[c] = df[c].map(_to_dec) if c in df.columns else D(0)
     for c in ("request_id", "organization_id", "model_group", "client", "status"):
-        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].astype(str).str.strip() if c in df.columns else ""
     return df
 
 
@@ -167,6 +183,8 @@ def parse_prices(xls: pd.ExcelFile) -> tuple[dict[str, str], pd.DataFrame]:
     i_id, i_list = org_cols.index("id организации"), org_cols.index("Прайс-лист")
     org_map: dict[str, str] = {}
     for _, row in raw.iloc[org_hdr + 1:].iterrows():
+        if pd.isna(row.iloc[i_id]):
+            break
         oid, plist = str(row.iloc[i_id]).strip(), str(row.iloc[i_list]).strip()
         if not re.fullmatch(r"[\w-]{20,}", oid):
             break
@@ -180,7 +198,10 @@ def parse_prices(xls: pd.ExcelFile) -> tuple[dict[str, str], pd.DataFrame]:
             "Input $/1M", "Output $/1M", "Cache read $/1M")}
     rows: list[dict[str, Any]] = []
     for _, row in raw.iloc[p_hdr + 1:].iterrows():
-        model = str(row.iloc[idx["Модель"]]).strip()
+        raw_model = row.iloc[idx["Модель"]]
+        if pd.isna(raw_model):
+            break
+        model = str(raw_model).strip()
         if not model or model.startswith("3."):
             break
         rows.append({
@@ -284,57 +305,74 @@ def _total(ref: dict[str, Decimal], row: Any) -> Decimal:
 
 def classify(row: Any, ref: dict[str, Decimal], rate: Rate | None,
              alt_rates: list[Rate]) -> tuple[str, str]:
-    """Возвращает (тип ошибки, доказательство). Подтверждение — пересчётом альтернативной ставкой."""
     exp = {c: getattr(row, c) for c in COST_COLS}
     ref_total = _total(ref, row)
+    comp_sum = sum(exp.values(), D(0))
+    dev = _max_dev(exp, ref)
 
-    # битый total выгрузки (не равен сумме своих компонент)
-    if abs(sum(exp.values(), D(0)) - row.total_cost) > Q8 * 2:
-        return "broken_total", f"total={row.total_cost} != sum={sum(exp.values(), D(0))}"
+    # 1. структурное повреждение total (всегда материально)
+    if abs(comp_sum - row.total_cost) > Q8 * 2:
+        if rate is not None and dev <= COMP_TOL:
+            if row.total_cost == 0:
+                return "total_zeroed", f"компоненты корректны (dev {dev}), total обнулён, Σ={comp_sum}"
+            return "broken_total", f"компоненты корректны, total={row.total_cost} vs Σ={comp_sum}"
+        return "broken_total", f"total={row.total_cost} != Σ={comp_sum}"
 
+    # 2. модель вне прайса
     if rate is None:
         if any(exp[c] > 0 for c in REF_COLS):
             return "not_in_pricelist", "модель вне прайса, но списание > 0"
         return "ok", ""
 
-    if all(q8(ref[c]) == exp[c] for c in REF_COLS) and abs(ref_total - row.total_cost) <= Q8 * 2:
+    # 3. точное совпадение компонент; total — в пределах округления до 8
+    if dev <= COMP_TOL and abs(ref_total - row.total_cost) <= Q8 * 2:
         return "ok", ""
 
-    bad = [c for c in REF_COLS if q8(ref[c]) != exp[c]]
+    # 4. порог значимости ДО сигнатур (как WHERE в SQL) — иначе sub-1e-6 строки раздувают material
+    if abs(row.total_cost - ref_total) <= config.MATERIAL_DELTA:
+        return "rounding_noise", "ниже порога значимости 1e-6"
 
-    # весь запрос по альтернативной ставке (подтверждение точным пересчётом)
+    # 5. весь запрос воспроизводится альтернативной ставкой (точное совпадение компонент)
     for alt in alt_rates:
         if alt == rate:
             continue
-        alt_ref = ref_components(row, alt)
-        if all(q8(alt_ref[c]) == exp[c] for c in REF_COLS):
+        if _max_dev(exp, ref_components(row, alt)) <= COMP_TOL:
             kind = "A_offpeak_in_peak" if alt.input < rate.input else "peak_in_offpeak"
-            return kind, f"выгрузка точно воспроизводится ставкой {alt.label} ({alt.window})"
+            return kind, f"воспроизводится ставкой {alt.label} ({alt.window})"
 
-    # только reasoning ×2
-    if bad == ["reasoning_cost"] and exp["reasoning_cost"] == q8(ref["reasoning_cost"] * 2):
-        if len(alt_rates) > 1:
-            return "B_reasoning_peak_in_offpeak", "reasoning ×2 = peak-ставка в off-peak окне"
-        return "C_reasoning_doubled", "reasoning ×2 у модели с одной ценой (окон нет)"
+    # 6. только reasoning ×2 (соседние компоненты точны)
+    others_ok = all(abs(exp[c] - ref[c]) <= COMP_TOL for c in REF_COLS if c != "reasoning_cost")
+    if others_ok and abs(exp["reasoning_cost"] - ref["reasoning_cost"] * 2) <= COMP_TOL:
+        if len({(r.input, r.output, r.cache_read) for r in alt_rates}) > 1:
+            return "B_reasoning_peak_in_offpeak", "reasoning ×2 (peak-ставка в off-peak окне)"
+        return "C_reasoning_doubled", "reasoning ×2 (модель с одной ценой)"
 
-    if abs(row.total_cost - ref_total) <= config.MATERIAL_DELTA:
-        return "rounding_noise", "расхождение в пределах округления выгрузки"
-    return "unclassified", f"расходятся компоненты: {bad}"
+    # 7. ratio-сигнатура (fallback)
+    bad = [c for c in REF_COLS if ref[c] > 0 and abs(exp[c] - ref[c]) > COMP_TOL]
+    if bad:
+        ratios = [exp[c] / ref[c] for c in bad]
+        if all(abs(r - D("0.5")) < D("0.000001") for r in ratios):
+            return "A_offpeak_in_peak", f"ratio≈0.5 по {bad}"
+        if all(abs(r - D(2)) < D("0.000001") for r in ratios):
+            return "peak_in_offpeak", f"ratio≈2 по {bad}"
+    return "unclassified", f"компоненты: {bad}, max dev {dev}"
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def reconcile(logs: pd.DataFrame, org_map: dict[str, str],
               sched: dict[tuple[str, str], list[Window]]) -> pd.DataFrame:
-    alt_cache: dict[tuple[str, str], list[Rate]] = {
-        k: list({w.rate for w in ws}) for k, ws in sched.items()
-    }
+    alt_cache = {k: list({w.rate for w in ws}) for k, ws in sched.items()}
     records: list[dict[str, Any]] = []
-    for row in logs.itertuples(index=False):
+    total, step = len(logs), max(1, len(logs) // 20)
+    for i, row in enumerate(logs.itertuples(index=False), 1):
         rate = resolve_rate(row.organization_id, row.model_group, row.start_time, org_map, sched)
         ref = ref_components(row, rate)
         correct = _total(ref, row)
         plist = org_map.get(row.organization_id, "")
-        alts = alt_cache.get((plist, row.model_group), [])
-        kind, evidence = classify(row, ref, rate, alts)
+        kind, evidence = classify(row, ref, rate, alt_cache.get((plist, row.model_group), []))
         records.append({
             "request_id": row.request_id, "start_time": row.start_time,
             "client": row.client, "model_group": row.model_group, "status": row.status,
@@ -342,6 +380,9 @@ def reconcile(logs: pd.DataFrame, org_map: dict[str, str],
             "delta": row.total_cost - correct, "error_type": kind, "evidence": evidence,
             "window": rate.window if rate else "—", "tariff": rate.label if rate else "zero",
         })
+        if i % step == 0 or i == total:
+            print(f"\r      расчёт: {i}/{total} ({i * 100 // total}%)", end="", flush=True)
+    print()
     return pd.DataFrame(records)
 
 
@@ -383,8 +424,10 @@ def run_checks(logs: pd.DataFrame, org_map: dict[str, str],
     checks.append(CheckResult("Модели вне прайса (zero-rule)", True,
                               f"списываются в 0: {zero_models or 'нет'}", len(zero_models)))
 
-    internal = logs.apply(
-        lambda r: abs(sum((r[c] for c in COST_COLS), D(0)) - r.total_cost) > Q8 * 2, axis=1)
+    comp_sum = logs[COST_COLS[0]].copy()
+    for c in COST_COLS[1:]:
+        comp_sum = comp_sum + logs[c]
+    internal = (comp_sum - logs["total_cost"]).abs() > Q8 * 2
     checks.append(CheckResult("total = сумма компонент (выгрузка)", not internal.any(),
                               f"{internal.sum()} битых total", int(internal.sum())))
 
@@ -396,43 +439,55 @@ def run_checks(logs: pd.DataFrame, org_map: dict[str, str],
 
 # ---------------------------------------------------------------- main
 def run(source: str) -> ReconcileResult:
+    t0 = time.perf_counter()
+    _log(f"[1/6] Загрузка: {source}")
     xls = load_workbook(source)
+    _log(f"      OK, {time.perf_counter() - t0:.1f}s")
+
+    _log("[2/6] Парсинг логов…")
     logs = parse_logs(xls)
+    _log(f"      {len(logs)} строк")
+
+    _log("[3/6] Парсинг прайса…")
     org_map, prices = parse_prices(xls)
     sched = build_schedule(prices)
+    _log(f"      {len(org_map)} орг, {len(prices)} строк прайса, {len(sched)} моделей")
 
+    _log("[4/6] Проверки данных…")
     checks = run_checks(logs, org_map, sched)
+    _log(f"      {len(checks)} проверок, FAIL: {sum(not c.passed for c in checks)}")
+
+    _log("[5/6] Эталонный расчёт…")
     result_df = reconcile(logs, org_map, sched)
 
-    material = result_df[~result_df.error_type.isin(["ok", "rounding_noise"])].copy()
+    # Конвенция material (одинаково в Python и SQL):
+    # значимое = |Δ| > 1e-6 ИЛИ структурное повреждение — независимое от суммы
+    STRUCTURAL_TYPES = ("broken_total", "total_zeroed", "not_in_pricelist")
+    material = result_df[
+        (result_df["delta"].abs() > config.MATERIAL_DELTA)
+        | result_df["error_type"].isin(STRUCTURAL_TYPES)
+    ].copy()
     material = material.sort_values("delta", key=lambda s: s.abs(), ascending=False)
-
     sum_correct = sum(result_df.correct_total.tolist(), D(0))
     sum_export = sum(result_df.export_total.tolist(), D(0))
-    totals = {
-        "rows": D(len(result_df)),
-        "correct": sum_correct,
-        "export": sum_export,
-        "delta": sum_export - sum_correct,
-        "discrepancies": D(len(material)),
-    }
-
+    totals = {"rows": D(len(result_df)), "correct": sum_correct, "export": sum_export,
+              "delta": sum_export - sum_correct, "discrepancies": D(len(material))}
     stats = (material.groupby("error_type")
              .agg(count=("request_id", "size"), impact=("delta", lambda s: sum(s.tolist(), D(0))))
              .reset_index().sort_values("impact", key=lambda s: s.abs(), ascending=False))
-
-    examples: dict[str, list[dict[str, Any]]] = {}
-    for kind, grp in material.groupby("error_type"):
-        examples[kind] = grp.head(2).to_dict("records")
-
-    return ReconcileResult(
-        source=source, generated_at=datetime.now(timezone.utc),
-        logs=result_df, discrepancies=material, checks=checks,
-        totals=totals, error_stats=stats, examples=examples,
-    )
+    examples = {
+        k: pd.concat([g.head(2), g.sample(n=min(1, len(g)), random_state=42)])
+           .drop_duplicates("request_id").to_dict("records")
+        for k, g in material.groupby("error_type")
+    }
+    _log(f"[6/6] Готово за {time.perf_counter() - t0:.1f}s")
+    return ReconcileResult(source, datetime.now(timezone.utc), result_df, material,
+                           checks, totals, stats, examples)
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Сверка биллинга DeepSeek")
     parser.add_argument("--file", help="локальный .xlsx")
     parser.add_argument("--url", help="ссылка на Google-таблицу", default=config.SHEET_URL)
@@ -444,6 +499,7 @@ def main() -> None:
     except (RuntimeError, FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"Ошибка: {exc}")
 
+    _log("Запись отчётов…")
     config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     # реестр генераторов: новый формат = функция + запись в reporting.REPORTERS
     for name, writer in reporting.REPORTERS.items():
